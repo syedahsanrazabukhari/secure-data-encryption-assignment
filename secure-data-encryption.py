@@ -1,98 +1,128 @@
-import streamlit as st
+import streamlit as st  # type: ignore
 import hashlib
-from cryptography.fernet import Fernet
+import base64
+import json
+import os
+import secrets
+from datetime import datetime, timedelta
+from cryptography.fernet import Fernet  # type: ignore
 
-st.set_page_config(page_title="🔐 Secure Data Encryption", layout="centered")
+# ----------------- File Paths ----------------- #
+VAULT_FILE = "vault.json"
+LOCK_FILE = "lock.json"
 
-KEY = Fernet.generate_key()
-cipher = Fernet(KEY)
+# ----------------- Load/Save Helpers ----------------- #
+def load_records():
+    if os.path.exists(VAULT_FILE):
+        with open(VAULT_FILE, "r") as f:
+            return json.load(f)
+    return {}
 
-if "stored_data" not in st.session_state:
-    st.session_state.stored_data = {} 
+def save_records(records):
+    with open(VAULT_FILE, "w") as f:
+        json.dump(records, f)
 
-if "failed_attempts" not in st.session_state:
-    st.session_state.failed_attempts = 0
+def get_lock_info():
+    if os.path.exists(LOCK_FILE):
+        with open(LOCK_FILE, "r") as f:
+            return json.load(f)
+    return {}
 
-def hash_passkey(passkey: str) -> str:
-    return hashlib.sha256(passkey.encode()).hexdigest()
+def save_lock_info(data):
+    with open(LOCK_FILE, "w") as f:
+        json.dump(data, f)
 
-def encrypt_data(text: str) -> str:
-    return cipher.encrypt(text.encode()).decode()
+# ----------------- Security Logic ----------------- #
+def derive_key(secret, salt=None):
+    if not salt:
+        salt = secrets.token_bytes(16)
+    dk = hashlib.pbkdf2_hmac("sha256", secret.encode(), salt, 100000)
+    return base64.b64encode(salt + dk).decode()
 
-def decrypt_data(encrypted_text: str, passkey: str):
-    hashed = hash_passkey(passkey)
-    entry = st.session_state.stored_data.get(encrypted_text)
+def verify_key(stored_hash, secret):
+    raw = base64.b64decode(stored_hash.encode())
+    salt = raw[:16]
+    new_dk = hashlib.pbkdf2_hmac("sha256", secret.encode(), salt, 100000)
+    return new_dk == raw[16:]
 
-    if entry and entry["passkey"] == hashed:
-        st.session_state.failed_attempts = 0
-        return cipher.decrypt(encrypted_text.encode()).decode()
-    else:
-        st.session_state.failed_attempts += 1
-        return None
+def fernet_key(secret):
+    return base64.urlsafe_b64encode(hashlib.sha256(secret.encode()).digest())
 
-menu = ["🏠 Home", "🗄️ Store Data", "🔓 Retrieve Data", "🔑 Login"]
-choice = st.sidebar.selectbox("Navigation", menu)
+def secure_encode(content, secret):
+    f = Fernet(fernet_key(secret))
+    return f.encrypt(content.encode()).decode()
 
-if choice == "🏠 Home":
-    st.title("🔐 Secure Data Encryption System")
-    st.markdown("""
-    Welcome to the **Secure Data App**!  
-    - Encrypt and store sensitive data with a secret passkey 🔑  
-    - Retrieve it securely later  
-    - Fully secure using **Fernet encryption** and **SHA-256 hashing**
-    """)
+def secure_decode(encrypted, secret):
+    f = Fernet(fernet_key(secret))
+    return f.decrypt(encrypted.encode()).decode()
 
-elif choice == "🗄️ Store Data":
-    st.header("🧾 Store Encrypted Data")
-
-    data_input = st.text_area("Enter the data you want to secure:")
-    pass_input = st.text_input("Create a secret passkey:", type="password")
+# ----------------- UI Views ----------------- #
+def store_view():
+    st.header("➕ Secure Your Data")
+    key = st.text_input("Unique Key (ID)", help="Must be unique")
+    info = st.text_area("Data to Encrypt")
+    passcode = st.text_input("Your Secret Passkey", type="password")
 
     if st.button("🔐 Encrypt & Save"):
-        if data_input and pass_input:
-            encrypted = encrypt_data(data_input)
-            hashed_pass = hash_passkey(pass_input)
+        if not key or not info or not passcode:
+            st.warning("All fields are required.")
+            return
 
-            st.session_state.stored_data[encrypted] = {
-                "encrypted_text": encrypted,
-                "passkey": hashed_pass
-            }
+        db = load_records()
+        if key in db:
+            st.error("This Key already exists!")
+            return
 
-            st.success("✅ Data encrypted and stored securely!")
-            st.code(encrypted, language="text")
+        encrypted = secure_encode(info, passcode)
+        hashed = derive_key(passcode)
+        db[key] = {"hash": hashed, "payload": encrypted}
+        save_records(db)
+        st.success("✅ Data encrypted and saved successfully!")
+
+def retrieve_view():
+    st.header("🔍 Retrieve Your Data")
+    key = st.text_input("Enter Your Key")
+    passcode = st.text_input("Enter Your Passkey", type="password")
+
+    lock_info = get_lock_info()
+    now = datetime.now()
+    if "until" in lock_info:
+        unlock_time = datetime.strptime(lock_info["until"], "%Y-%m-%d %H:%M:%S")
+        if now < unlock_time:
+            st.error(f"🚫 Locked. Try again after {unlock_time.strftime('%H:%M:%S')}")
+            return
+
+    if st.button("🔓 Decrypt"):
+        db = load_records()
+        if key not in db:
+            st.error("❌ Key not found.")
+            return
+
+        entry = db[key]
+        if verify_key(entry["hash"], passcode):
+            text = secure_decode(entry["payload"], passcode)
+            st.success("Access Granted!")
+            st.info(f"Decrypted Content: {text}")
+            st.session_state.attempts = 0
         else:
-            st.error("⚠️ Please enter both data and passkey!")
+            st.error("Incorrect Passkey.")
+            st.session_state.attempts += 1
+            if st.session_state.attempts >= 3:
+                lock_time = (now + timedelta(seconds=30)).strftime("%Y-%m-%d %H:%M:%S")
+                save_lock_info({"until": lock_time})
+                st.warning("Too many attempts. Locked for 30 seconds.")
 
-elif choice == "🔓 Retrieve Data":
-    st.header("🔎 Retrieve Encrypted Data")
+# ----------------- App Entry Point ----------------- #
+def run():
+    st.set_page_config("Secure Vault", page_icon="🔐")
+    if "attempts" not in st.session_state:
+        st.session_state.attempts = 0
 
-    encrypted_input = st.text_area("Paste the encrypted data:")
-    pass_input = st.text_input("Enter your passkey:", type="password")
+    menu = st.sidebar.radio("Select Option", ["Secure Data", "Retrieve Data"])
 
-    if st.button("🔍 Decrypt Data"):
-        if encrypted_input and pass_input:
-            result = decrypt_data(encrypted_input, pass_input)
+    if menu == "Secure Data":
+        store_view()
+    else:
+        retrieve_view()
 
-            if result:
-                st.success("✅ Decryption Successful!")
-                st.write(f"🔓 Decrypted Message: `{result}`")
-            else:
-                attempts_left = 3 - st.session_state.failed_attempts
-                st.error(f"❌ Invalid passkey! Attempts remaining: {attempts_left}")
-
-                if st.session_state.failed_attempts >= 3:
-                    st.warning("🚫 Too many failed attempts. Please login again to continue.")
-                    st.switch_page("🔑 Login") 
-        else:
-            st.warning("Please provide both the encrypted data and the passkey.")
-
-elif choice == "🔑 Login":
-    st.header("🔐 Reauthorization Required")
-    login_key = st.text_input("Enter admin password:", type="password")
-
-    if st.button("🔓 Login"):
-        if login_key == "admin123":
-            st.session_state.failed_attempts = 0
-            st.success("✅ Access granted! You may now retrieve data.")
-        else:
-            st.error("❌ Incorrect password!")
+run()
